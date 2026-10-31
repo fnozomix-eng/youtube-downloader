@@ -1,0 +1,208 @@
+//@version=6
+// =============================================================================
+//  MTF スーパーボリンジャー（マーフィー式）+ アラート
+//  - 期間21 / ±1σ・±2σ・±3σ / 遅行スパン（終値を21本前に表示）
+//  - 移動平均 SMA / EMA 切り替え
+//  - 2系統のバンド（時間足を個別指定可能 = MTF）
+//  - アラート: バンドタッチ / 実体ブレーク / 遅行スパンタッチ
+//  アラート設定: 条件にこのインジケーターを選び「alert() 関数呼び出しのみ」を選択
+// =============================================================================
+indicator("MTF Super Bollinger (Murphy) + Alerts", shorttitle = "MTF SuperBB", overlay = true)
+
+// ───────── 共通設定（マーフィー式デフォルト） ─────────
+G0 = "■ スーパーボリンジャー設定"
+maType    = input.string("SMA", "移動平均タイプ", options = ["SMA", "EMA"], group = G0)
+bbLen     = input.int(21, "期間", minval = 2, group = G0)
+mult1     = input.float(1.0, "σ1 倍率", step = 0.1, group = G0)
+mult2     = input.float(2.0, "σ2 倍率", step = 0.1, group = G0)
+mult3     = input.float(3.0, "σ3 倍率", step = 0.1, group = G0)
+lagLen    = input.int(21, "遅行スパン期間", minval = 2, group = G0, tooltip = "当日を1本目として数えます（一目均衡表の遅行スパンと同じ数え方）。21 の場合、終値を20本左にずらして表示します。")
+showLag   = input.bool(true, "遅行スパンを表示（チャート時間足）", group = G0)
+noRepaint = input.bool(true, "上位足はリペイント防止（確定値を使用）", group = G0, tooltip = "ON: 上位足バンドは確定済みの値を使用（1本遅れるがリペイントしない）。OFF: 形成中の上位足でリアルタイムに更新。")
+
+// ───────── バンド1 / バンド2 ─────────
+G1 = "■ バンド1"
+show1 = input.bool(true, "表示", inline = "b1", group = G1)
+tf1   = input.timeframe("", "時間足", inline = "b1", group = G1, tooltip = "空欄 = チャートの時間足")
+G2 = "■ バンド2（上位足）"
+show2 = input.bool(true, "表示", inline = "b2", group = G2)
+tf2   = input.timeframe("240", "時間足", inline = "b2", group = G2, tooltip = "チャートより上位の時間足を指定してください")
+
+// ───────── 表示 ─────────
+GV = "■ 表示"
+colMid = input.color(color.new(color.orange, 0),   "移動平均", group = GV)
+col1   = input.color(color.new(color.green, 0),    "±1σ",    group = GV)
+col2   = input.color(color.new(color.blue, 0),     "±2σ",    group = GV)
+col3   = input.color(color.new(color.red, 0),      "±3σ",    group = GV)
+colLag = input.color(color.new(color.fuchsia, 0),  "遅行スパン", group = GV)
+transp2 = input.int(50, "バンド2 の透明度", minval = 0, maxval = 100, group = GV)
+
+// ───────── アラート ─────────
+GA = "■ アラート"
+alBB1     = input.bool(true, "バンド1 を対象", inline = "as", group = GA)
+alBB2     = input.bool(true, "バンド2 を対象", inline = "as", group = GA)
+alTouch   = input.bool(true, "バンドタッチ（ヒゲ含む）", group = GA)
+alBreak   = input.bool(true, "実体ブレーク", group = GA)
+breakMode = input.string("終値で抜け", "実体ブレーク判定", options = ["終値で抜け", "実体が完全に外側"], group = GA, tooltip = "終値で抜け: 終値がラインを跨いだ足\n実体が完全に外側: 始値・終値ともにラインの外側に出た最初の足")
+alLag     = input.bool(true, "遅行スパンタッチ", group = GA, tooltip = "遅行スパン（当該時間足の終値）が、遅行スパン位置のバンド/移動平均にタッチ（跨いだ・到達した）時")
+lvOn3     = input.bool(true,  "±3σ",     inline = "lv", group = GA)
+lvOn2     = input.bool(true,  "±2σ",     inline = "lv", group = GA)
+lvOn1     = input.bool(false, "±1σ",     inline = "lv", group = GA)
+lvOnMid   = input.bool(false, "移動平均", inline = "lv", group = GA)
+confOnly  = input.bool(true, "確定足のみで発報（チャート足）", group = GA)
+
+// ───────── 計算 ─────────
+// o: 参照オフセット（0 = 現在値 / 1 = 確定値）
+f_bb(int o) =>
+    basis = maType == "SMA" ? ta.sma(close, bbLen) : ta.ema(close, bbLen)
+    dev   = ta.stdev(close, bbLen)
+    k     = lagLen - 1
+    // [ 移動平均, σ, 終値, 前終値, 遅行位置の移動平均, 遅行位置のσ, 前足の遅行位置の移動平均, 前足の遅行位置のσ ]
+    [basis[o], dev[o], close[o], close[o + 1], basis[o + k], dev[o + k], basis[o + k + 1], dev[o + k + 1]]
+
+f_tfEff(string tf) => tf == "" ? timeframe.period : tf
+f_isHigher(string tf) => timeframe.in_seconds(f_tfEff(tf)) > timeframe.in_seconds(timeframe.period)
+
+f_tfName(string tf) =>
+    t   = f_tfEff(tf)
+    sec = timeframe.in_seconds(t)
+    sec >= 86400 ? t : sec % 3600 == 0 ? str.tostring(sec / 3600) + "H" : sec % 60 == 0 ? str.tostring(sec / 60) + "m" : str.tostring(sec) + "s"
+
+// 表示・タッチ/ブレーク用
+f_main(string tf) =>
+    rp = noRepaint and f_isHigher(tf)
+    request.security(syminfo.tickerid, f_tfEff(tf), f_bb(rp ? 1 : 0), lookahead = rp ? barmerge.lookahead_on : barmerge.lookahead_off)
+
+// 遅行スパン判定用（上位足は常に確定値）
+f_lagData(string tf) =>
+    h = f_isHigher(tf)
+    request.security(syminfo.tickerid, f_tfEff(tf), f_bb(h ? 1 : 0), lookahead = h ? barmerge.lookahead_on : barmerge.lookahead_off)
+
+[b1, d1, c1_, cp1_, bl1, dl1, blp1, dlp1] = f_main(tf1)
+[b2, d2, c2_, cp2_, bl2, dl2, blp2, dlp2] = f_main(tf2)
+[_b1, _d1, lc1, lcp1, lb1, ld1, lbp1, ldp1] = f_lagData(tf1)
+[_b2, _d2, lc2, lcp2, lb2, ld2, lbp2, ldp2] = f_lagData(tf2)
+
+// ───────── 描画 ─────────
+f_c(color c, int t) => color.new(c, math.max(color.t(c), t))
+
+plot(show1 ? b1 + d1 * mult3 : na, "B1 +3σ", col3)
+plot(show1 ? b1 + d1 * mult2 : na, "B1 +2σ", col2)
+plot(show1 ? b1 + d1 * mult1 : na, "B1 +1σ", col1)
+plot(show1 ? b1              : na, "B1 MA",  colMid, 2)
+plot(show1 ? b1 - d1 * mult1 : na, "B1 -1σ", col1)
+plot(show1 ? b1 - d1 * mult2 : na, "B1 -2σ", col2)
+plot(show1 ? b1 - d1 * mult3 : na, "B1 -3σ", col3)
+
+plot(show2 ? b2 + d2 * mult3 : na, "B2 +3σ", f_c(col3, transp2),   2, style = plot.style_stepline)
+plot(show2 ? b2 + d2 * mult2 : na, "B2 +2σ", f_c(col2, transp2),   2, style = plot.style_stepline)
+plot(show2 ? b2 + d2 * mult1 : na, "B2 +1σ", f_c(col1, transp2),   2, style = plot.style_stepline)
+plot(show2 ? b2              : na, "B2 MA",  f_c(colMid, transp2), 3, style = plot.style_stepline)
+plot(show2 ? b2 - d2 * mult1 : na, "B2 -1σ", f_c(col1, transp2),   2, style = plot.style_stepline)
+plot(show2 ? b2 - d2 * mult2 : na, "B2 -2σ", f_c(col2, transp2),   2, style = plot.style_stepline)
+plot(show2 ? b2 - d2 * mult3 : na, "B2 -3σ", f_c(col3, transp2),   2, style = plot.style_stepline)
+
+plot(showLag ? close : na, "遅行スパン", colLag, 2, offset = -(lagLen - 1))
+
+// ───────── アラート判定 ─────────
+var LV_NAMES = array.from("+3σ", "+2σ", "+1σ", "MA", "-1σ", "-2σ", "-3σ")
+
+f_levels(float b, float d) =>
+    array.from(b + d * mult3, b + d * mult2, b + d * mult1, b, b - d * mult1, b - d * mult2, b - d * mult3)
+
+f_lvOn(int i) =>
+    i == 3 ? lvOnMid : (i == 2 or i == 4) ? lvOn1 : (i == 1 or i == 5) ? lvOn2 : lvOn3
+
+// タッチ / 実体ブレーク（チャート足で判定）
+f_touchBreak(string label, float b, float d, float bP, float dP) =>
+    string msg = ""
+    bool anyTouch = false
+    bool anyBreak = false
+    lv  = f_levels(b, d)
+    lvP = f_levels(bP, dP)
+    bodyHi  = math.max(open, close)
+    bodyLo  = math.min(open, close)
+    bodyHiP = math.max(open[1], close[1])
+    bodyLoP = math.min(open[1], close[1])
+    for i = 0 to 6
+        L  = lv.get(i)
+        LP = lvP.get(i)
+        if f_lvOn(i) and not na(L)
+            nm = LV_NAMES.get(i)
+            if alTouch and high >= L and low <= L
+                anyTouch := true
+                msg += label + " " + nm + " タッチ\n"
+            if alBreak and not na(LP)
+                up = breakMode == "終値で抜け" ? (close > L and close[1] <= LP) : (bodyLo > L and bodyLoP <= LP)
+                dn = breakMode == "終値で抜け" ? (close < L and close[1] >= LP) : (bodyHi < L and bodyHiP >= LP)
+                if up
+                    anyBreak := true
+                    msg += label + " " + nm + " 実体ブレーク（上抜け）\n"
+                if dn
+                    anyBreak := true
+                    msg += label + " " + nm + " 実体ブレーク（下抜け）\n"
+    [msg, anyTouch, anyBreak]
+
+// 遅行スパンタッチ（当該時間足で判定）
+f_lagTouch(string label, float c, float cP, float b, float d, float bP, float dP) =>
+    string msg = ""
+    bool anyLag = false
+    lv  = f_levels(b, d)
+    lvP = f_levels(bP, dP)
+    for i = 0 to 6
+        L  = lv.get(i)
+        LP = lvP.get(i)
+        if f_lvOn(i) and not na(L) and not na(LP) and not na(cP)
+            up = cP < LP and c >= L
+            dn = cP > LP and c <= L
+            if up or dn
+                anyLag := true
+                msg += label + " 遅行スパン " + LV_NAMES.get(i) + " タッチ（" + (up ? "上抜け" : "下抜け") + "）\n"
+    [msg, anyLag]
+
+lbl1 = "[" + f_tfName(tf1) + "]"
+lbl2 = "[" + f_tfName(tf2) + "]"
+
+// 前足の値（チャート足ベース）は毎バー評価してヒストリーを確保
+[tbMsg1, touch1, brk1] = f_touchBreak(lbl1, b1, d1, b1[1], d1[1])
+[tbMsg2, touch2, brk2] = f_touchBreak(lbl2, b2, d2, b2[1], d2[1])
+[lagMsg1, lagHit1] = f_lagTouch(lbl1, lc1, lcp1, lb1, ld1, lbp1, ldp1)
+[lagMsg2, lagHit2] = f_lagTouch(lbl2, lc2, lcp2, lb2, ld2, lbp2, ldp2)
+
+// 発報タイミング
+chartGate = confOnly ? barstate.isconfirmed : true
+// 遅行スパン: 上位足は新しい足が始まった瞬間（=前の上位足が確定）に1回、チャート足は確定時
+lagGate1 = f_isHigher(tf1) ? timeframe.change(f_tfEff(tf1)) : barstate.isconfirmed
+lagGate2 = f_isHigher(tf2) ? timeframe.change(f_tfEff(tf2)) : barstate.isconfirmed
+
+fireTB1  = alBB1 and chartGate
+fireTB2  = alBB2 and chartGate
+fireLag1 = alBB1 and alLag and lagGate1
+fireLag2 = alBB2 and alLag and lagGate2
+
+string msgAll = ""
+if fireTB1
+    msgAll += tbMsg1
+if fireTB2
+    msgAll += tbMsg2
+if fireLag1
+    msgAll += lagMsg1
+if fireLag2
+    msgAll += lagMsg2
+
+if msgAll != ""
+    alert(syminfo.ticker + " (" + timeframe.period + ") 価格 " + str.tostring(close, format.mintick) + "\n" + msgAll, confOnly ? alert.freq_once_per_bar_close : alert.freq_once_per_bar)
+
+// 個別アラート（「条件」から個別に設定したい場合用）
+alertcondition(fireTB1 and touch1,          "バンド1 タッチ",           "{{ticker}} バンド1 タッチ")
+alertcondition(fireTB1 and brk1,            "バンド1 実体ブレーク",     "{{ticker}} バンド1 実体ブレーク")
+alertcondition(fireLag1 and lagHit1,        "バンド1 遅行スパンタッチ", "{{ticker}} バンド1 遅行スパンタッチ")
+alertcondition(fireTB2 and touch2,          "バンド2 タッチ",           "{{ticker}} バンド2 タッチ")
+alertcondition(fireTB2 and brk2,            "バンド2 実体ブレーク",     "{{ticker}} バンド2 実体ブレーク")
+alertcondition(fireLag2 and lagHit2,        "バンド2 遅行スパンタッチ", "{{ticker}} バンド2 遅行スパンタッチ")
+
+// チャート上のマーカー（実体ブレーク / 遅行スパンタッチ）
+plotshape(fireTB1 and brk1,   "B1 実体ブレーク",     shape.diamond,  location.abovebar, color.new(color.yellow, 0), size = size.tiny)
+plotshape(fireTB2 and brk2,   "B2 実体ブレーク",     shape.diamond,  location.belowbar, color.new(color.aqua, 0),   size = size.tiny)
+plotshape(fireLag1 and lagHit1, "B1 遅行スパンタッチ", shape.circle, location.top,      colLag,                     size = size.tiny)
+plotshape(fireLag2 and lagHit2, "B2 遅行スパンタッチ", shape.circle, location.bottom,   f_c(colLag, transp2),       size = size.tiny)
