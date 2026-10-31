@@ -1,0 +1,81 @@
+//@version=6
+// 平均足スムーズド (Heiken Ashi Smoothed) をローソク足チャートに重ねて表示
+//  1) 価格の O/H/L/C を 1段目の移動平均で平滑化
+//  2) 平滑化した O/H/L/C から平均足を計算
+//  3) 平均足の O/H/L/C を 2段目の移動平均でさらに平滑化
+indicator("Heiken Ashi Smoothed Overlay", shorttitle = "HAS", overlay = true, max_bars_back = 500)
+
+// ---------- 入力 ----------
+const string GRP_MA   = "平滑化設定"
+const string GRP_VIEW = "表示設定"
+
+maType1 = input.string("SMMA (RMA)", "1段目 MA 種類", options = ["SMA", "EMA", "SMMA (RMA)", "WMA"], group = GRP_MA)
+maLen1  = input.int(6, "1段目 MA 期間", minval = 1, group = GRP_MA)
+maType2 = input.string("WMA", "2段目 MA 種類", options = ["SMA", "EMA", "SMMA (RMA)", "WMA"], group = GRP_MA)
+maLen2  = input.int(2, "2段目 MA 期間", minval = 1, group = GRP_MA)
+
+bullCol   = input.color(color.new(#1E90FF, 60), "陽線の色", group = GRP_VIEW)
+bearCol   = input.color(color.new(#FF6347, 60), "陰線の色", group = GRP_VIEW)
+showWick  = input.bool(true, "ヒゲを表示する", group = GRP_VIEW)
+showBorder = input.bool(true, "枠線を表示する", group = GRP_VIEW)
+colorBars = input.bool(false, "通常ローソク足も HAS の色で塗る", group = GRP_VIEW)
+
+// ---------- 移動平均 ----------
+// ta.* はすべてのバーで呼ぶ必要があるので、先に全部計算してから選ぶ
+ma(float src, simple int len, simple string t) =>
+    float sma = ta.sma(src, len)
+    float ema = ta.ema(src, len)
+    float rma = ta.rma(src, len)
+    float wma = ta.wma(src, len)
+    switch t
+        "SMA"        => sma
+        "EMA"        => ema
+        "SMMA (RMA)" => rma
+        => wma
+
+// ---------- 1) 価格の平滑化 ----------
+float o1 = ma(open,  maLen1, maType1)
+float h1 = ma(high,  maLen1, maType1)
+float l1 = ma(low,   maLen1, maType1)
+float c1 = ma(close, maLen1, maType1)
+
+// ---------- 2) 平均足 ----------
+float haClose = (o1 + h1 + l1 + c1) / 4
+float haOpen  = na
+haOpen := na(haOpen[1]) ? (o1 + c1) / 2 : (haOpen[1] + haClose[1]) / 2
+float haHigh  = math.max(h1, math.max(haOpen, haClose))
+float haLow   = math.min(l1, math.min(haOpen, haClose))
+
+// ---------- 3) 平均足の平滑化 ----------
+float sO = ma(haOpen,  maLen2, maType2)
+float sC = ma(haClose, maLen2, maType2)
+float sH = ma(haHigh,  maLen2, maType2)
+float sL = ma(haLow,   maLen2, maType2)
+
+// 平滑化後に実体がヒゲからはみ出さないよう補正
+float wickH = math.max(sH, math.max(sO, sC))
+float wickL = math.min(sL, math.min(sO, sC))
+
+// 色 (同値なら直前の色を維持)
+var bool isBull = true
+if sC > sO
+    isBull := true
+else if sC < sO
+    isBull := false
+
+color bodyCol = isBull ? bullCol : bearCol
+
+// ---------- 描画 ----------
+plotcandle(sO, showWick ? wickH : math.max(sO, sC), showWick ? wickL : math.min(sO, sC), sC,
+     title       = "HAS",
+     color       = bodyCol,
+     wickcolor   = showWick ? bodyCol : na,
+     bordercolor = showBorder ? color.new(bodyCol, 0) : na)
+
+barcolor(colorBars ? color.new(bodyCol, 0) : na, title = "Bar color")
+
+// ---------- アラート ----------
+bool turnBull = isBull and not isBull[1]
+bool turnBear = not isBull and isBull[1]
+alertcondition(turnBull, "HAS 陽転", "{{ticker}} {{interval}}: 平均足スムーズドが陽線に転換")
+alertcondition(turnBear, "HAS 陰転", "{{ticker}} {{interval}}: 平均足スムーズドが陰線に転換")
