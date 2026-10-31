@@ -1,0 +1,228 @@
+//@version=6
+// =============================================================================
+//  MTF GMMA（複合型移動平均線）+ アラート
+//  - 短期群 EMA 3,5,8,10,12,15 / 長期群 EMA 30,35,40,45,50,60
+//  - 2系統（時間足を個別指定 = MTF）
+//  - 線の色: 上向き = 同色系グラデーション / 横ばい = 黄色 / 下向き = 同色系グラデーション
+//  - アラート: 群へのタッチ / 群の上抜け・下抜け / ゴールデンクロス・デッドクロス
+//  アラート設定: 条件にこのインジケーターを選び「alert() 関数呼び出しのみ」を選択
+// =============================================================================
+indicator("MTF GMMA + Alerts", shorttitle = "MTF GMMA", overlay = true)
+
+// ───────── GMMA 設定 ─────────
+G0 = "■ GMMA 設定"
+s1 = input.int(3,  "短期1", minval = 1, inline = "s", group = G0)
+s2 = input.int(5,  "短期2", minval = 1, inline = "s", group = G0)
+s3 = input.int(8,  "短期3", minval = 1, inline = "s", group = G0)
+s4 = input.int(10, "短期4", minval = 1, inline = "s2", group = G0)
+s5 = input.int(12, "短期5", minval = 1, inline = "s2", group = G0)
+s6 = input.int(15, "短期6", minval = 1, inline = "s2", group = G0)
+l1 = input.int(30, "長期1", minval = 1, inline = "l", group = G0)
+l2 = input.int(35, "長期2", minval = 1, inline = "l", group = G0)
+l3 = input.int(40, "長期3", minval = 1, inline = "l", group = G0)
+l4 = input.int(45, "長期4", minval = 1, inline = "l2", group = G0)
+l5 = input.int(50, "長期5", minval = 1, inline = "l2", group = G0)
+l6 = input.int(60, "長期6", minval = 1, inline = "l2", group = G0)
+slopeLen  = input.int(1, "傾き判定の本数", minval = 1, group = G0, tooltip = "EMA と n 本前の EMA の差で向きを判定")
+flatThr   = input.float(0.05, "横ばい判定（ATR倍率）", minval = 0, step = 0.01, group = G0, tooltip = "|EMA − n本前EMA| が ATR(14)×この値 未満なら横ばい（黄色）")
+noRepaint = input.bool(true, "上位足はリペイント防止（確定値を使用）", group = G0)
+
+// ───────── 時間足 ─────────
+G1 = "■ GMMA 1"
+show1 = input.bool(true, "表示", inline = "b1", group = G1)
+tf1   = input.timeframe("", "時間足", inline = "b1", group = G1, tooltip = "空欄 = チャートの時間足")
+G2 = "■ GMMA 2（上位足）"
+show2 = input.bool(true, "表示", inline = "b2", group = G2)
+tf2   = input.timeframe("240", "時間足", inline = "b2", group = G2)
+
+// ───────── 色 ─────────
+GV = "■ 色（上向き/下向きは同色系グラデーション）"
+upLight = input.color(#B9F6CA, "上向き 短期側", inline = "up", group = GV)
+upDark  = input.color(#1B5E20, "上向き 長期側", inline = "up", group = GV)
+dnLight = input.color(#FF8A80, "下向き 短期側", inline = "dn", group = GV)
+dnDark  = input.color(#7F0000, "下向き 長期側", inline = "dn", group = GV)
+flatCol = input.color(#FFEB3B, "横ばい", group = GV)
+transp2 = input.int(40, "GMMA 2 の透明度", minval = 0, maxval = 100, group = GV)
+showX   = input.bool(true, "GC / DC マーカー表示", group = GV)
+
+// ───────── アラート ─────────
+GA = "■ アラート"
+alSet1   = input.bool(true, "GMMA 1 を対象", inline = "as", group = GA)
+alSet2   = input.bool(true, "GMMA 2 を対象", inline = "as", group = GA)
+alTouch  = input.bool(true, "タッチ", group = GA, tooltip = "ローソク足が群（最上線〜最下線の帯）に触れた最初の足")
+alBreak  = input.bool(true, "上抜け / 下抜け", group = GA, tooltip = "終値が群の最上線を上抜け / 最下線を下抜け")
+grpShort = input.bool(true, "対象: 短期群", inline = "g", group = GA)
+grpLong  = input.bool(true, "対象: 長期群", inline = "g", group = GA)
+alCross  = input.bool(true, "ゴールデンクロス / デッドクロス", group = GA)
+crossMode = input.string("平均線", "クロス判定", options = ["平均線", "群全体"], group = GA, tooltip = "平均線: 短期群の平均が長期群の平均を上抜け/下抜け\n群全体: 短期群のすべてが長期群のすべてより上/下に抜けた最初の足")
+confOnly = input.bool(true, "確定足のみで発報（チャート足）", group = GA)
+
+// ───────── 計算 ─────────
+f_st(float e, float atr) =>
+    d = e - e[slopeLen]
+    na(d) or na(atr) ? 0 : d > atr * flatThr ? 1 : d < -atr * flatThr ? -1 : 0
+
+f_gmma(int o) =>
+    atr = ta.atr(14)
+    e1 = ta.ema(close, s1)
+    e2 = ta.ema(close, s2)
+    e3 = ta.ema(close, s3)
+    e4 = ta.ema(close, s4)
+    e5 = ta.ema(close, s5)
+    e6 = ta.ema(close, s6)
+    e7 = ta.ema(close, l1)
+    e8 = ta.ema(close, l2)
+    e9 = ta.ema(close, l3)
+    e10 = ta.ema(close, l4)
+    e11 = ta.ema(close, l5)
+    e12 = ta.ema(close, l6)
+    t1 = f_st(e1, atr)
+    t2 = f_st(e2, atr)
+    t3 = f_st(e3, atr)
+    t4 = f_st(e4, atr)
+    t5 = f_st(e5, atr)
+    t6 = f_st(e6, atr)
+    t7 = f_st(e7, atr)
+    t8 = f_st(e8, atr)
+    t9 = f_st(e9, atr)
+    t10 = f_st(e10, atr)
+    t11 = f_st(e11, atr)
+    t12 = f_st(e12, atr)
+    [e1[o], e2[o], e3[o], e4[o], e5[o], e6[o], e7[o], e8[o], e9[o], e10[o], e11[o], e12[o],
+     t1[o], t2[o], t3[o], t4[o], t5[o], t6[o], t7[o], t8[o], t9[o], t10[o], t11[o], t12[o]]
+
+f_tfEff(string tf) => tf == "" ? timeframe.period : tf
+f_isHigher(string tf) => timeframe.in_seconds(f_tfEff(tf)) > timeframe.in_seconds(timeframe.period)
+f_tfName(string tf) =>
+    t   = f_tfEff(tf)
+    sec = timeframe.in_seconds(t)
+    sec >= 86400 ? t : sec % 3600 == 0 ? str.tostring(sec / 3600) + "H" : sec % 60 == 0 ? str.tostring(sec / 60) + "m" : str.tostring(sec) + "s"
+
+f_req(string tf) =>
+    rp = noRepaint and f_isHigher(tf)
+    request.security(syminfo.tickerid, f_tfEff(tf), f_gmma(rp ? 1 : 0), lookahead = rp ? barmerge.lookahead_on : barmerge.lookahead_off)
+
+[a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, at1, at2, at3, at4, at5, at6, at7, at8, at9, at10, at11, at12] = f_req(tf1)
+[b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, bt1, bt2, bt3, bt4, bt5, bt6, bt7, bt8, bt9, bt10, bt11, bt12] = f_req(tf2)
+
+// ───────── 描画 ─────────
+// st: 1=上向き 0=横ばい -1=下向き / idx: 0(最短)〜11(最長)
+f_col(int st, int idx, int tr) =>
+    c = st > 0 ? color.from_gradient(idx, 0, 11, upLight, upDark) : st < 0 ? color.from_gradient(idx, 0, 11, dnLight, dnDark) : flatCol
+    color.new(c, tr)
+
+plot(show1 ? a1  : na, "G1 短期1", f_col(at1, 0, 0), 1)
+plot(show1 ? a2  : na, "G1 短期2", f_col(at2, 1, 0), 1)
+plot(show1 ? a3  : na, "G1 短期3", f_col(at3, 2, 0), 1)
+plot(show1 ? a4  : na, "G1 短期4", f_col(at4, 3, 0), 1)
+plot(show1 ? a5  : na, "G1 短期5", f_col(at5, 4, 0), 1)
+plot(show1 ? a6  : na, "G1 短期6", f_col(at6, 5, 0), 1)
+plot(show1 ? a7  : na, "G1 長期1", f_col(at7, 6, 0), 2)
+plot(show1 ? a8  : na, "G1 長期2", f_col(at8, 7, 0), 2)
+plot(show1 ? a9  : na, "G1 長期3", f_col(at9, 8, 0), 2)
+plot(show1 ? a10 : na, "G1 長期4", f_col(at10, 9, 0), 2)
+plot(show1 ? a11 : na, "G1 長期5", f_col(at11, 10, 0), 2)
+plot(show1 ? a12 : na, "G1 長期6", f_col(at12, 11, 0), 2)
+
+plot(show2 ? b1  : na, "G2 短期1", f_col(bt1, 0, transp2), 2, style = plot.style_stepline)
+plot(show2 ? b2  : na, "G2 短期2", f_col(bt2, 1, transp2), 2, style = plot.style_stepline)
+plot(show2 ? b3  : na, "G2 短期3", f_col(bt3, 2, transp2), 2, style = plot.style_stepline)
+plot(show2 ? b4  : na, "G2 短期4", f_col(bt4, 3, transp2), 2, style = plot.style_stepline)
+plot(show2 ? b5  : na, "G2 短期5", f_col(bt5, 4, transp2), 2, style = plot.style_stepline)
+plot(show2 ? b6  : na, "G2 短期6", f_col(bt6, 5, transp2), 2, style = plot.style_stepline)
+plot(show2 ? b7  : na, "G2 長期1", f_col(bt7, 6, transp2), 3, style = plot.style_stepline)
+plot(show2 ? b8  : na, "G2 長期2", f_col(bt8, 7, transp2), 3, style = plot.style_stepline)
+plot(show2 ? b9  : na, "G2 長期3", f_col(bt9, 8, transp2), 3, style = plot.style_stepline)
+plot(show2 ? b10 : na, "G2 長期4", f_col(bt10, 9, transp2), 3, style = plot.style_stepline)
+plot(show2 ? b11 : na, "G2 長期5", f_col(bt11, 10, transp2), 3, style = plot.style_stepline)
+plot(show2 ? b12 : na, "G2 長期6", f_col(bt12, 11, transp2), 3, style = plot.style_stepline)
+
+// ───────── アラート判定 ─────────
+f_max6(float x1, float x2, float x3, float x4, float x5, float x6) => math.max(x1, x2, x3, x4, x5, x6)
+f_min6(float x1, float x2, float x3, float x4, float x5, float x6) => math.min(x1, x2, x3, x4, x5, x6)
+
+// ゾーン（群）に対するタッチ / 上抜け / 下抜け
+f_zone(string label, string gname, float zHi, float zLo) =>
+    string msg = ""
+    bool touch = false
+    bool brk = false
+    if not na(zHi) and not na(zLo)
+        inZ  = high >= zLo and low <= zHi
+        inZP = high[1] >= zLo[1] and low[1] <= zHi[1]
+        if alTouch and inZ and not inZP
+            touch := true
+            dir = close[1] > zHi[1] ? "上から" : close[1] < zLo[1] ? "下から" : ""
+            msg += label + " " + gname + " タッチ" + (dir != "" ? "（" + dir + "）" : "") + "\n"
+        if alBreak
+            if close > zHi and close[1] <= zHi[1]
+                brk := true
+                msg += label + " " + gname + " 上抜け\n"
+            if close < zLo and close[1] >= zLo[1]
+                brk := true
+                msg += label + " " + gname + " 下抜け\n"
+    [msg, touch, brk]
+
+// ゴールデンクロス / デッドクロス
+f_cross(float sHi, float sLo, float sAvg, float lHi, float lLo, float lAvg) =>
+    bull = sLo > lHi
+    bear = sHi < lLo
+    gcAvg = ta.crossover(sAvg, lAvg)
+    dcAvg = ta.crossunder(sAvg, lAvg)
+    gcAll = bull and not bull[1]
+    dcAll = bear and not bear[1]
+    gc = crossMode == "平均線" ? gcAvg : gcAll
+    dc = crossMode == "平均線" ? dcAvg : dcAll
+    [gc, dc]
+
+f_set(string label, float e1, float e2, float e3, float e4, float e5, float e6, float e7, float e8, float e9, float e10, float e11, float e12) =>
+    sHi = f_max6(e1, e2, e3, e4, e5, e6)
+    sLo = f_min6(e1, e2, e3, e4, e5, e6)
+    lHi = f_max6(e7, e8, e9, e10, e11, e12)
+    lLo = f_min6(e7, e8, e9, e10, e11, e12)
+    sAvg = (e1 + e2 + e3 + e4 + e5 + e6) / 6
+    lAvg = (e7 + e8 + e9 + e10 + e11 + e12) / 6
+    [mS, tS, bS] = f_zone(label, "短期群", sHi, sLo)
+    [mL, tL, bL] = f_zone(label, "長期群", lHi, lLo)
+    [gc, dc] = f_cross(sHi, sLo, sAvg, lHi, lLo, lAvg)
+    string msg = ""
+    if grpShort
+        msg += mS
+    if grpLong
+        msg += mL
+    if alCross and gc
+        msg += label + " ゴールデンクロス\n"
+    if alCross and dc
+        msg += label + " デッドクロス\n"
+    touch = (grpShort and tS) or (grpLong and tL)
+    brk   = (grpShort and bS) or (grpLong and bL)
+    [msg, touch, brk, gc, dc, lAvg]
+
+[msg1, touch1, brk1, gc1, dc1, lAvg1] = f_set("[" + f_tfName(tf1) + "]", a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
+[msg2, touch2, brk2, gc2, dc2, lAvg2] = f_set("[" + f_tfName(tf2) + "]", b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12)
+
+gate  = confOnly ? barstate.isconfirmed : true
+fire1 = alSet1 and gate
+fire2 = alSet2 and gate
+
+string msgAll = ""
+if fire1
+    msgAll += msg1
+if fire2
+    msgAll += msg2
+if msgAll != ""
+    alert(syminfo.ticker + " (" + timeframe.period + ") 価格 " + str.tostring(close, format.mintick) + "\n" + msgAll, confOnly ? alert.freq_once_per_bar_close : alert.freq_once_per_bar)
+
+alertcondition(fire1 and touch1, "GMMA1 タッチ",             "{{ticker}} GMMA1 タッチ")
+alertcondition(fire1 and brk1,   "GMMA1 上抜け/下抜け",      "{{ticker}} GMMA1 上抜け/下抜け")
+alertcondition(fire1 and gc1,    "GMMA1 ゴールデンクロス",   "{{ticker}} GMMA1 ゴールデンクロス")
+alertcondition(fire1 and dc1,    "GMMA1 デッドクロス",       "{{ticker}} GMMA1 デッドクロス")
+alertcondition(fire2 and touch2, "GMMA2 タッチ",             "{{ticker}} GMMA2 タッチ")
+alertcondition(fire2 and brk2,   "GMMA2 上抜け/下抜け",      "{{ticker}} GMMA2 上抜け/下抜け")
+alertcondition(fire2 and gc2,    "GMMA2 ゴールデンクロス",   "{{ticker}} GMMA2 ゴールデンクロス")
+alertcondition(fire2 and dc2,    "GMMA2 デッドクロス",       "{{ticker}} GMMA2 デッドクロス")
+
+// GC / DC マーカー
+plotshape(showX and show1 and gc1, "G1 GC", shape.triangleup,   location.belowbar, color.new(upDark, 0), size = size.small, text = "GC")
+plotshape(showX and show1 and dc1, "G1 DC", shape.triangledown, location.abovebar, color.new(dnDark, 0), size = size.small, text = "DC")
+plotshape(showX and show2 and gc2, "G2 GC", shape.triangleup,   location.belowbar, color.new(upDark, transp2), size = size.normal, text = "GC2")
+plotshape(showX and show2 and dc2, "G2 DC", shape.triangledown, location.abovebar, color.new(dnDark, transp2), size = size.normal, text = "DC2")
